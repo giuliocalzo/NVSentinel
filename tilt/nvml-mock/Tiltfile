@@ -1,0 +1,66 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Included by tilt/Tiltfile when USE_NVML_MOCK=1: the nvml-mock chart plus the official GPU Operator.
+
+load('ext://helm_resource', 'helm_resource', 'helm_repo')
+
+nvml_mock_version = os.getenv('NVML_MOCK_VERSION', '0.5.1')
+gpu_profile = os.getenv('GPU_PROFILE', 'gb300')
+gpu_operator_version = os.getenv('GPU_OPERATOR_VERSION', 'v26.3.3')
+
+nvml_mock_chart = 'oci://ghcr.io/nvidia/k8s-test-infra/chart/nvml-mock'
+nvml_mock_namespace = 'nvml-mock'
+
+# The NVSentinel guide's values: they keep the standalone DCGM that the GPU health monitor polls.
+gpu_operator_values = os.path.join(os.path.dirname(config.main_path), 'nvml-mock', 'gpu-operator-values.yaml')
+
+# The chart tolerates every taint, so select the workers to keep it off the control planes.
+helm_resource(
+    'nvml-mock',
+    nvml_mock_chart,
+    namespace=nvml_mock_namespace,
+    flags=[
+        '--create-namespace',
+        '--version', nvml_mock_version,
+        '--set', 'gpu.profile=' + gpu_profile,
+        '--set', 'gpu.dynamicMetrics.enabled=true',
+        '--set-string', 'nodeSelector.nvml-mock\\.nvidia\\.com/type=sgpu',
+    ],
+    labels=['nvml-mock'],
+)
+
+helm_repo('nvidia', 'https://helm.ngc.nvidia.com/nvidia', labels=['gpu-operator'])
+
+helm_resource(
+    'gpu-operator',
+    'nvidia/gpu-operator',
+    namespace='gpu-operator',
+    flags=[
+        '--create-namespace',
+        '--version', gpu_operator_version,
+        '--values', gpu_operator_values,
+        '--timeout', '300s',
+    ],
+    resource_deps=['nvidia', 'nvml-mock'],
+    labels=['gpu-operator'],
+)
+
+# Only the nvml-mock setup enables metadata-collector, so nothing else builds its image.
+docker_build(
+    'ghcr.io/nvidia/nvsentinel/metadata-collector',
+    context='../..',
+    dockerfile='../../metadata-collector/Dockerfile',
+    only=['commons', 'data-models', 'metadata-collector'],
+)

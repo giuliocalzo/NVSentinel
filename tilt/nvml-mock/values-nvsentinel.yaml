@@ -1,0 +1,63 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Values overlay for USE_NVML_MOCK=1, from the k8s-test-infra nv-sentinel guide.
+global:
+  # Publishes the slowdown T.Limit offset the thermal margin check needs.
+  metadataCollector:
+    enabled: true
+  # Mock GPUs have no NIC topology, which the NIC monitor needs.
+  nicHealthMonitor:
+    enabled: false
+  # Not used by the thermal test. Leaving them out keeps the control plane within a 4-CPU runner.
+  cspHealthMonitor:
+    enabled: false
+  syslogHealthMonitor:
+    enabled: false
+
+labeler:
+  # No driver DaemonSet to detect.
+  assumeDriverInstalled: true
+
+gpu-health-monitor:
+  dcgmHealthCheck:
+    # The mock has no NVLink error counters, which DCGM reports as BER threshold violations.
+    suppressedErrorCodes:
+      - DCGM_FR_NVLINK_EFFECTIVE_BER_THRESHOLD
+      - DCGM_FR_NVLINK_SYMBOL_BER_THRESHOLD
+
+fault-quarantine:
+  circuitBreaker:
+    # With two GPU nodes, one cordoned node (50%) trips the default breaker and blocks the uncordon.
+    percentage: 100
+  # The default request does not fit one control plane on a 4-CPU runner.
+  resources:
+    requests:
+      cpu: 100m
+
+# The default requests do not fit one control plane on a 4-CPU runner.
+health-events-analyzer:
+  resources:
+    requests:
+      cpu: 100m
+
+mongodb-store:
+  mongodb:
+    resources:
+      requests:
+        cpu: 100m
+    metrics:
+      resources:
+        requests:
+          cpu: 50m
