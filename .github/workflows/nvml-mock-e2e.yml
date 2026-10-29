@@ -1,0 +1,182 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: NVML Mock E2E
+
+# Based on the NVSentinel guide in NVIDIA/k8s-test-infra (docs/guides/nv-sentinel).
+# nvml-mock fakes libnvidia-ml, GPU Operator runs a standalone DCGM on top of it,
+# and NVSentinel must detect a GPU thermal-margin fault, cordon and drain the node,
+# then uncordon it after the GPU cools down. No physical GPU is needed.
+#
+# Unlike the guide's run.sh, Tilt builds the NVSentinel images from this repository, so the job
+# tests the code under review. tilt/nvml-mock/Tiltfile (included with USE_NVML_MOCK=1) installs the published nvml-mock chart and
+# the official GPU Operator.
+#
+# Configuration:
+# - Set RUNNER_ARCH_LARGE_AMD64 variable to override the default AMD64 runner
+# - Forks fall back to ubuntu-latest and run on pull requests and workflow_dispatch
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+  # Runs on pull requests in forks only; the job condition skips it upstream.
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read       # Required for checking out code
+
+jobs:
+  nvml-mock-e2e:
+    if: github.repository != 'nvidia/nvsentinel' || github.event_name != 'pull_request'
+    name: "NVML Mock E2E (AMD64)"
+    runs-on: ${{ (github.repository == 'nvidia/nvsentinel' && (vars.RUNNER_ARCH_LARGE_AMD64 || 'linux-amd64-cpu32')) || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      # Images the charts start at run time. They are loaded into the Kind nodes so the nodes do not pull them.
+      RUNTIME_IMAGES: >-
+        public.ecr.aws/docker/library/busybox:1.37.0
+        public.ecr.aws/docker/library/alpine:3.21
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Workaround for freeing up more disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          docker system prune -f
+
+      - name: Prep system for multi-node Kind cluster
+        run: |
+          sudo modprobe br_netfilter || echo "unable to run modprobe"
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          sudo sysctl -w fs.inotify.max_user_instances=1024
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          # The docker driver builds from the local image store, so the base images pulled below are used
+          # even where a Dockerfile pins them by digest. A docker-container builder would query the registry.
+          driver: docker
+
+      - name: Install E2E testing tools
+        uses: ./.github/actions/install-e2e-tools
+
+      - name: Configure Helm repositories
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+
+      - name: Pull base images from mirror.gcr.io
+        timeout-minutes: 10
+        run: |
+          # public.ecr.aws rate-limits shared hosted runner IPs. Pull the same Docker Hub official images from
+          # mirror.gcr.io and retag them with the public.ecr.aws names the Dockerfiles and the charts use.
+          # A digest-pinned image is pulled by its digest: the tag on the mirror can point to a newer build.
+          images=$(grep -rhE '^FROM public\.ecr\.aws/docker/library/' --include='Dockerfile*' . | awk '{print $2}' | sort -u)
+          for image in ${images} ${RUNTIME_IMAGES}; do
+            ref="${image%@*}"
+            name="${ref#public.ecr.aws/docker/library/}"
+            if [ "${image}" != "${ref}" ]; then
+              mirror="mirror.gcr.io/library/${name%:*}@${image#*@}"
+            else
+              mirror="mirror.gcr.io/library/${name}"
+            fi
+            docker pull --quiet "${mirror}" && docker tag "${mirror}" "${ref}" && echo "Pulled ${mirror} as ${ref}"
+          done
+
+      - name: Compute ref name with short SHA
+        id: ref-name
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          SAFE_REF="${{ github.ref_name }}-${SHORT_SHA}"
+          # Sanitize ref name: replace slashes with hyphens for Docker tag compatibility
+          SAFE_REF=$(echo "$SAFE_REF" | sed 's/\//-/g')
+          echo "value=${SAFE_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Create cluster
+        run: |
+          ./tilt/nvml-mock/create-cluster.sh
+          # Load the retagged runtime images into the nodes. Single-platform archives: `kind load docker-image`
+          # fails on multi-platform images with the containerd image store.
+          for image in ${RUNTIME_IMAGES}; do
+            docker save --platform linux/amd64 --output /tmp/runtime-image.tar "${image}" \
+              && kind load image-archive /tmp/runtime-image.tar --name ci \
+              && echo "Loaded ${image} ($(du -h /tmp/runtime-image.tar | cut -f1)) into the Kind nodes" \
+              || echo "::warning::could not preload ${image} into the Kind nodes"
+            rm -f /tmp/runtime-image.tar
+          done
+          # Show the preloaded images on each node.
+          for node in $(kind get nodes --name ci); do
+            echo "--- ${node}"
+            docker exec "${node}" crictl images | grep -E 'busybox|alpine' || echo "no runtime images on ${node}"
+          done
+
+      - name: Deploy NVSentinel with Tilt
+        env:
+          CI_COMMIT_REF_NAME: ${{ steps.ref-name.outputs.value }}
+        run: ./tilt/nvml-mock/deploy.sh
+
+      - name: Run NVML Mock E2E tests
+        working-directory: tests
+        run: |
+          go test -race -tags nvml_mock -run TestNVMLMock -timeout 30m -count 1 -v ./...
+
+      - name: Export Kind logs
+        if: always()
+        run: |
+          mkdir -p /tmp/kind-logs
+          kind export logs /tmp/kind-logs --name ci || true
+
+      - name: Collect debug artifacts
+        if: failure()
+        run: |
+          mkdir -p /tmp/debug-artifacts
+          kubectl get all --all-namespaces > /tmp/debug-artifacts/all-resources.txt || true
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' > /tmp/debug-artifacts/all-events.txt || true
+          kubectl get nodes -o yaml > /tmp/debug-artifacts/nodes-full.yaml || true
+          kubectl describe nodes > /tmp/debug-artifacts/nodes-describe.txt || true
+          kubectl logs --all-namespaces --all-containers=true --tail=500 > /tmp/debug-artifacts/all-logs.txt || true
+          df -h > /tmp/debug-artifacts/disk-usage.txt || true
+
+      - name: Upload Kind logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: nvml-mock-e2e-kind-logs-${{ github.run_id }}
+          path: /tmp/kind-logs/
+          retention-days: 7
+
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: nvml-mock-e2e-debug-artifacts-${{ github.run_id }}
+          path: /tmp/debug-artifacts/
+          retention-days: 7
+
+      - name: Delete Kind cluster
+        if: always()
+        run: kind delete cluster --name ci || true

@@ -32,8 +32,13 @@ use_postgresql = os.getenv('USE_POSTGRESQL', '0') == '1'
 disable_tls = os.getenv('DISABLE_TLS', '0') == '1'
 use_percona_env = os.getenv('USE_PERCONA', '0') == '1'
 use_pc_deployment = os.getenv('USE_DEPLOYMENT_PLATFORM_CONNECTOR', '0') == '1'
+# Use nvml-mock GPUs and the official GPU Operator instead of the fake driver/DCGM DaemonSets.
+# ./nvml-mock/Tiltfile installs both.
+use_nvml_mock = os.getenv('USE_NVML_MOCK', '0') == '1'
 user_values_file = os.getenv('NVSENTINEL_VALUES_FILE', '')
 print_values = os.getenv('PRINT_HELM_VALUES', '0') == '1'
+# KWOK controller, stages and fake nodes. The nvml-mock setup runs on real Kind workers and sets USE_KWOK=0.
+use_kwok = os.getenv('USE_KWOK', '1') == '1'
 
 if use_postgresql:
     print("Using PostgreSQL as datastore (USE_POSTGRESQL=1)")
@@ -58,6 +63,7 @@ helm_resource(
         '--set=installCRDs=true',
         '--version=' + cert_manager_version,  # pin: an unpinned chart floats to new releases mid-flight
     ],
+    resource_deps=['jetstack'],
 )
 
 helm_repo('prometheus-community', 'https://prometheus-community.github.io/helm-charts')
@@ -74,6 +80,7 @@ helm_resource(
         '--set=nodeExporter.enabled=false',
         '--set=prometheusOperator.enabled=true',
     ],
+    resource_deps=['prometheus-community'],
 )
 
 local_resource(
@@ -81,40 +88,42 @@ local_resource(
     cmd='helm upgrade --install kai-scheduler oci://ghcr.io/nvidia/kai-scheduler/kai-scheduler --version v0.12.10 --create-namespace -n kai-scheduler --wait',
 )
 
-helm_repo('sigs-kwok', 'https://kwok.sigs.k8s.io/charts/')
-# kwok must NOT run with hostNetwork: kwok stamps its own pod IP on every fake
-# node (--node-ip=$(POD_IP)), so with hostNetwork the fake nodes clone this
-# pod's host-node IP, kindnetd then treats them as that node and rewrites its
-# CNI config with fake podCIDRs, and real pods created there get duplicate IPs
-# whose traffic NetworkPolicy enforcement misattributes and drops.
-#
-# Without hostNetwork, the fake nodes get the kwok pod IP. kindnetd cannot route
-# through a pod IP and restarts in a loop, which drops connections (see
-# kubernetes-sigs/kwok#819). Set POD_IP, which the chart passes as --node-ip, to
-# an unused kind network address instead (see kwok-node-ip.sh). Helm replaces the
-# env list, so HOST_IP keeps the chart default here.
-kwok_node_ip = str(local('./kwok-node-ip.sh', quiet=True)).strip()
-helm_resource(
-    'kwok',
-    chart='sigs-kwok/kwok',
-    namespace='kube-system',
-    flags=[
-        '--version=0.3.0',  # pin: an unpinned chart floats to new releases mid-flight
-        '--set=env[0].name=POD_IP',
-        '--set=env[0].value=' + kwok_node_ip,
-        '--set=env[1].name=HOST_IP',
-        '--set=env[1].valueFrom.fieldRef.fieldPath=status.hostIP',
-    ]
-)
-helm_resource(
-    'kwok-stage-fast',
-    chart='sigs-kwok/stage-fast',
-    resource_deps=['kwok'],
-    pod_readiness='ignore',
-    flags=[
-        '--version=0.3.0'
-    ]
-)
+if use_kwok:
+    helm_repo('sigs-kwok', 'https://kwok.sigs.k8s.io/charts/')
+    # kwok must NOT run with hostNetwork: kwok stamps its own pod IP on every fake
+    # node (--node-ip=$(POD_IP)), so with hostNetwork the fake nodes clone this
+    # pod's host-node IP, kindnetd then treats them as that node and rewrites its
+    # CNI config with fake podCIDRs, and real pods created there get duplicate IPs
+    # whose traffic NetworkPolicy enforcement misattributes and drops.
+    #
+    # Without hostNetwork, the fake nodes get the kwok pod IP. kindnetd cannot route
+    # through a pod IP and restarts in a loop, which drops connections (see
+    # kubernetes-sigs/kwok#819). Set POD_IP, which the chart passes as --node-ip, to
+    # an unused kind network address instead (see kwok-node-ip.sh). Helm replaces the
+    # env list, so HOST_IP keeps the chart default here.
+    kwok_node_ip = str(local('./kwok-node-ip.sh', quiet=True)).strip()
+    helm_resource(
+        'kwok',
+        chart='sigs-kwok/kwok',
+        namespace='kube-system',
+        flags=[
+            '--version=0.3.0',  # pin: an unpinned chart floats to new releases mid-flight
+            '--set=env[0].name=POD_IP',
+            '--set=env[0].value=' + kwok_node_ip,
+            '--set=env[1].name=HOST_IP',
+            '--set=env[1].valueFrom.fieldRef.fieldPath=status.hostIP',
+        ],
+        resource_deps=['sigs-kwok'],
+    )
+    helm_resource(
+        'kwok-stage-fast',
+        chart='sigs-kwok/stage-fast',
+        resource_deps=['kwok', 'sigs-kwok'],
+        pod_readiness='ignore',
+        flags=[
+            '--version=0.3.0'
+        ]
+    )
 
 namespace_create('gpu-operator')
 namespace_create('nvsentinel')
@@ -129,7 +138,7 @@ elif arch in ['x86_64', 'amd64']:
 else:
     k8s_arch = 'amd64'  # Default to amd64 for unknown architectures
 
-skip_kwok_nodes = os.getenv('SKIP_KWOK_NODES_IN_TILT', '0') == '1'
+skip_kwok_nodes = not use_kwok or os.getenv('SKIP_KWOK_NODES_IN_TILT', '0') == '1'
 
 if not skip_kwok_nodes:
     # Create regular GPU nodes (all NUM_GPU_NODES are regular nodes)
@@ -148,17 +157,20 @@ if not skip_kwok_nodes:
 else:
     print("Skipping KWOK node creation in Tilt (SKIP_KWOK_NODES_IN_TILT=1)")
 
-k8s_yaml('./nvidia-driver-daemonset.yaml')
-# Mount the NVML injection spec from the repo so the pinned fake-dcgm image
-# serves fields added after it was published (e.g. DCGM field 153). Generated
-# offline (--dry-run=client) from the single source-of-truth spec.
-k8s_yaml(local(
-    'kubectl create configmap nvidia-dcgm-gpu-spec -n gpu-operator ' +
-    '--from-file=gpu-spec.yaml=./dcgm-fake/gpu-spec.yaml ' +
-    '--dry-run=client -o yaml',
-    quiet=True,
-))
-k8s_yaml('./nvidia-dcgm-daemonset.yaml')
+if not use_nvml_mock:
+    k8s_yaml('./nvidia-driver-daemonset.yaml')
+    # Mount the NVML injection spec from the repo so the pinned fake-dcgm image
+    # serves fields added after it was published (e.g. DCGM field 153). Generated
+    # offline (--dry-run=client) from the single source-of-truth spec.
+    k8s_yaml(local(
+        'kubectl create configmap nvidia-dcgm-gpu-spec -n gpu-operator ' +
+        '--from-file=gpu-spec.yaml=./dcgm-fake/gpu-spec.yaml ' +
+        '--dry-run=client -o yaml',
+        quiet=True,
+    ))
+    k8s_yaml('./nvidia-dcgm-daemonset.yaml')
+else:
+    include('./nvml-mock/Tiltfile')
 
 include('../fault-quarantine/Tiltfile')
 include('../fault-remediation/Tiltfile')
@@ -166,18 +178,20 @@ include('../janitor/Tiltfile')
 include('../janitor-provider/Tiltfile')
 include('../node-drainer/Tiltfile')
 include('../platform-connectors/Tiltfile')
-include('./simple-health-client/Tiltfile')
 include('./event-exporter-mock/Tiltfile')
-include('./csp-api-mock/Tiltfile')
 include('../health-events-analyzer/Tiltfile')
 include('../event-exporter/Tiltfile')
 include('../health-monitors/gpu-health-monitor/Tiltfile')
-include('../health-monitors/csp-health-monitor/Tiltfile')
 include('../health-monitors/kubernetes-object-monitor/Tiltfile')
 include('../health-monitors/nvcre-certification-monitor/Tiltfile')
-include('../health-monitors/syslog-health-monitor/Tiltfile')
 include('../health-monitors/slurm-drain-monitor/Tiltfile')
 include('../health-monitors/nic-health-monitor/Tiltfile')
+# The nvml-mock e2e runs on one control plane, so it leaves out what its test does not use.
+if not use_nvml_mock:
+    include('./simple-health-client/Tiltfile')
+    include('./csp-api-mock/Tiltfile')
+    include('../health-monitors/csp-health-monitor/Tiltfile')
+    include('../health-monitors/syslog-health-monitor/Tiltfile')
 include('../labeler/Tiltfile')
 include('../log-collector/Tiltfile')
 include('../preflight/Tiltfile')
@@ -209,6 +223,9 @@ if k8s_arch == 'arm64':
 
 if use_pc_deployment:
     values_files.append('../distros/kubernetes/nvsentinel/values-tilt-deployment.yaml')
+
+if use_nvml_mock:
+    values_files.append('./nvml-mock/values-nvsentinel.yaml')
 
 # Add user-specified values file if provided. It should be the last in the chain to override other settings.
 if user_values_file:
@@ -440,26 +457,31 @@ k8s_resource(
     resource_deps=['platform-connectors']
 )
 
-k8s_resource(
-    'syslog-health-monitor-regular',
-    resource_deps=['platform-connectors']
-)
+if not use_nvml_mock:
+    k8s_resource(
+        'syslog-health-monitor-regular',
+        resource_deps=['platform-connectors']
+    )
 
-k8s_resource(
-    'nic-health-monitor',
-    resource_deps=['platform-connectors', 'nic-metadata-stub']
-)
+# The real metadata-collector (USE_NVML_MOCK=1) reports no NIC topology on mock GPUs, so the NIC
+# monitor is disabled there and has no workload to wire.
+if not use_nvml_mock:
+    k8s_resource(
+        'nic-health-monitor',
+        resource_deps=['platform-connectors', 'nic-metadata-stub']
+    )
 
-local_resource(
-    'nic-metadata-stub',
-    cmd='./inject-nic-metadata-stub.sh',
-    resource_deps=['platform-connectors', 'labeler'],
-)
+    local_resource(
+        'nic-metadata-stub',
+        cmd='./inject-nic-metadata-stub.sh',
+        resource_deps=['platform-connectors', 'labeler'],
+    )
 
-k8s_resource(
-    'simple-health-client',
-    resource_deps=['platform-connectors']
-)
+if not use_nvml_mock:
+    k8s_resource(
+        'simple-health-client',
+        resource_deps=['platform-connectors']
+    )
 
 k8s_resource(
     'event-exporter',
@@ -496,30 +518,34 @@ k8s_resource(
     resource_deps=[datastore_resource]
 )
 
-k8s_resource(
-    'csp-health-monitor',
-    resource_deps=[datastore_resource, 'csp-api-mock']
-)
+if not use_nvml_mock:
+    k8s_resource(
+        'csp-health-monitor',
+        resource_deps=[datastore_resource, 'csp-api-mock']
+    )
 
-k8s_resource(
-    'kwok-stage-fast',
-    pod_readiness='ignore',
-    resource_deps=['kwok']
-)
+if use_kwok:
+    k8s_resource(
+        'kwok-stage-fast',
+        pod_readiness='ignore',
+        resource_deps=['kwok']
+    )
 k8s_resource(
     workload='gpu-health-monitor-dcgm-3.x',
     pod_readiness='ignore'
 )
-k8s_resource(
-    workload='syslog-health-monitor-kata',
-    pod_readiness='ignore'
-)
+if not use_nvml_mock:
+    k8s_resource(
+        workload='syslog-health-monitor-kata',
+        pod_readiness='ignore'
+    )
 
-# This is a workaround to ensure that pods are deleted with respect to finalizers
-# source: https://github.com/kubernetes-sigs/kwok/discussions/926#discussioncomment-8204558
-k8s_yaml('./kwok-pod-delete-respect-finalizers.yaml')
-k8s_resource(
-    new_name='kwok-pod-delete-stage',
-    objects=['pod-delete:stage'],
-    resource_deps=['kwok', 'kwok-stage-fast']
-)
+if use_kwok:
+    # This is a workaround to ensure that pods are deleted with respect to finalizers
+    # source: https://github.com/kubernetes-sigs/kwok/discussions/926#discussioncomment-8204558
+    k8s_yaml('./kwok-pod-delete-respect-finalizers.yaml')
+    k8s_resource(
+        new_name='kwok-pod-delete-stage',
+        objects=['pod-delete:stage'],
+        resource_deps=['kwok', 'kwok-stage-fast']
+    )
